@@ -31,6 +31,7 @@ import (
 	"go/constant"
 	"internal/buildcfg"
 	"strconv"
+	"strings"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/inline/inlheur"
@@ -68,6 +69,9 @@ var (
 	// List of all hot call sites. CallSiteInfo.Callee is always nil.
 	// TODO(prattmic): Make this non-global.
 	candHotEdgeMap = make(map[pgoir.CallSiteInfo]struct{})
+
+	// Mapping from a link function name to its *ir.Func
+	nameToFunc = make(map[string]*ir.Func)
 
 	// Threshold in percentage for hot callsite inlining.
 	inlineHotCallSiteThresholdPercent float64
@@ -876,7 +880,24 @@ func inlineCostOK(n *ir.CallExpr, caller, callee *ir.Func, bigCaller bool) (bool
 	}
 
 	lineOffset := pgoir.NodeLineOffset(n, caller)
-	csi := pgoir.CallSiteInfo{LineOffset: lineOffset, Caller: caller}
+	parentCallerName := ir.LinkFuncName(caller)
+	parentInlIdx := base.Ctxt.PosTable.Pos(n.Pos()).Base().InliningIndex()
+	if parentInlIdx >= 0 {
+		parentCallerName = base.Ctxt.InlTree.InlinedFunction(parentInlIdx).Name
+	}
+
+	parentCaller := caller
+	baseOffset := lineOffset
+
+	// TODO: inlining into runtime.bgsweep causes a freeze on BenchmarkBinaryTree17 (go1),
+	// the reason is unknown.
+	if nameToFunc[parentCallerName] != nil && !(strings.HasPrefix(ir.LinkFuncName(nameToFunc[parentCallerName]), "runtime.lock") &&
+		ir.LinkFuncName(caller) == "runtime.bgsweep") {
+		parentCaller = nameToFunc[parentCallerName]
+		lineOffset = pgoir.NodeLineOffset(n, parentCaller)
+	}
+
+	csi := pgoir.CallSiteInfo{LineOffset: lineOffset, Caller: parentCaller}
 	_, hot := candHotEdgeMap[csi]
 
 	if metric <= maxCost {
@@ -892,6 +913,13 @@ func inlineCostOK(n *ir.CallExpr, caller, callee *ir.Func, bigCaller bool) (bool
 		return false, maxCost, metric, false
 	}
 
+	if base.Debug.PGODebug > 0 && baseOffset != lineOffset {
+		fmt.Printf("parent caller = %v (start line: %v, callsite offset: %v), callee = %v, caller = %v\n",
+			ir.LinkFuncName(parentCaller), int(base.Ctxt.InnermostPos(parentCaller.Pos()).RelLine()),
+			lineOffset, ir.LinkFuncName(callee), ir.LinkFuncName(caller))
+		fmt.Printf("changed offset from %v to %v\n", baseOffset, lineOffset)
+	}
+
 	// Hot
 
 	if bigCaller {
@@ -901,8 +929,16 @@ func inlineCostOK(n *ir.CallExpr, caller, callee *ir.Func, bigCaller bool) (bool
 		return false, maxCost, metric, false
 	}
 
-	if metric > inlineHotMaxBudget {
-		return false, inlineHotMaxBudget, metric, false
+	hotMaxBudget := inlineHotMaxBudget
+	if caller.Pragma&ir.Nosplit != 0 {
+		// After inlining, some runtime functions may be increased in such a way
+		// that they no longer satisfy the constraints of a nosplit stack limit.
+		// Reduce inlineHotMaxBudget as a workaround.
+		hotMaxBudget = inlineHotMaxBudget / 2
+	}
+
+	if metric > hotMaxBudget {
+		return false, hotMaxBudget, metric, false
 	}
 
 	if !base.PGOHash.MatchPosWithInfo(n.Pos(), "inline", nil) {
@@ -925,6 +961,7 @@ func inlineCostOK(n *ir.CallExpr, caller, callee *ir.Func, bigCaller bool) (bool
 //
 // Preconditions: CanInline(callee) has already been called.
 func canInlineCallExpr(callerfn *ir.Func, n *ir.CallExpr, callee *ir.Func, bigCaller bool, log bool) (bool, int32, bool) {
+	nameToFunc[ir.LinkFuncName(callee)] = callee
 	if callee.Inl == nil {
 		// callee is never inlinable.
 		if log && logopt.Enabled() {
